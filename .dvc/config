@@ -1,0 +1,4 @@
+[core]
+    remote = bikes
+['remote "bikes"']
+    url = s3://airbridge-childy-data/result_2024
