@@ -1,0 +1,162 @@
+import boto3
+import sys
+import logging
+import torch
+import torchvision
+import scipy
+
+import csv
+from io import StringIO
+
+import numpy as np
+from scipy.sparse import csr_matrix
+
+import pandas as pd
+from sklearn.preprocessing import minmax_scale
+from recommenders.datasets import movielens
+from recommenders.utils.timer import Timer
+from recommenders.utils.python_utils import binarize
+from recommenders.datasets.python_splitters import python_stratified_split
+from recommenders.models.sar import SAR
+from recommenders.evaluation.python_evaluation import (
+    map,
+    ndcg_at_k,
+    precision_at_k,
+    recall_at_k,
+    rmse,
+    mae,
+    logloss,
+    rsquared,
+    exp_var
+)
+from recommenders.utils.notebook_utils import store_metadata
+
+
+
+print(f"System version: {sys.version}")
+print(f"NumPy version: {np.__version__}")
+print(f"Pandas version: {pd.__version__}")
+print(f"scipy version: {scipy.__version__}")
+
+
+
+
+# top k items to recommend
+TOP_K = 25
+
+# Select MovieLens data size: 100k, 1m, 10m, or 20m
+MOVIELENS_DATA_SIZE = "100k"
+
+
+def get_all_files_in_folder(bucket_name, folder_path):
+    # AWS 자격 증명을 설정합니다. 환경 변수 또는 AWS 자격 증명 프로파일을 사용할 수 있습니다.
+    s3 = boto3.client('s3')
+
+    # 버킷에서 객체 목록을 가져옵니다.
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=folder_path)
+
+    # 객체 목록에서 파일 키(경로)를 추출합니다.
+    files = []
+    for obj in response.get('Contents', []):
+        files.append(obj['Key'])
+
+    return files
+
+
+
+def read_csv_from_s3(bucket_name, file_key):
+    # S3 객체를 읽어오기 위해 클라이언트 생성
+    s3 = boto3.client('s3')
+    
+    # S3 객체를 읽어오고 CSV 파일 내용을 문자열로 읽기
+    response = s3.get_object(Bucket=bucket_name, Key=file_key)
+    csv_content = response['Body'].read().decode('utf-8')
+    
+    # CSV 문자열을 파일 형식으로 변환
+    csv_file = pd.read_csv(StringIO(csv_content))
+
+    return csv_file
+
+
+# S3 버킷 이름을 지정합니다.
+bucket_name = 'airbridge-childy-data'
+folder_path = 'result_2024/'
+
+
+# 모든 파일을 가져옵니다.
+folder_files = get_all_files_in_folder(bucket_name, folder_path)
+folder_files = folder_files[1:]
+
+# interact_df = read_csv_from_s3(bucket_name, folder_path)
+
+
+# 각 CSV 파일을 읽고 각 행을 출력합니다.
+for file_key in folder_files:
+    interact_df = read_csv_from_s3(bucket_name, file_key)
+
+
+# event type별로 점수
+interact_df['rating'] = interact_df['EVENT_TYPE'].map({'View': 1, 'Purchase': 2, 'Add To Cart': 3})
+# interact_df['rating'] = interact_df['rating'].astype(np.float32)
+
+
+# 필터링할 USER_ID
+target_user_id = ["18tmdgml@yahoo.co.kr", "KAID1739322288"]
+
+
+# 특정 컬럼 제외하기
+columns_to_exclude = ['PRICE', 'EVENT_TYPE']
+df_filtered = interact_df.drop(columns=columns_to_exclude)
+
+
+# 특정 USER_ID로 필터링
+filtered_df = df_filtered[df_filtered['USER_ID'].isin(target_user_id)]
+
+
+train, test = python_stratified_split(filtered_df, ratio=0.75, col_user="USER_ID", col_item="ITEM_ID", seed=42)
+
+
+
+print("""
+Train:
+Total Ratings: {train_total}
+Unique Users: {train_users}
+Unique Items: {train_items}
+
+Test:
+Total Ratings: {test_total}
+Unique Users: {test_users}
+Unique Items: {test_items}
+""".format(
+    train_total=len(train),
+    train_users=len(train['USER_ID'].unique()),
+    train_items=len(train['ITEM_ID'].unique()),
+    test_total=len(test),
+    test_users=len(test['USER_ID'].unique()),
+    test_items=len(test['ITEM_ID'].unique()),
+))
+
+
+logging.basicConfig(level=logging.DEBUG, 
+                    format='%(asctime)s %(levelname)-8s %(message)s')
+
+
+model = SAR(
+    col_user="USER_ID",
+    col_timestamp="TIMESTAMP",
+    col_item="ITEM_ID",
+    col_rating="rating",
+    similarity_type="jaccard", 
+    time_decay_coefficient=30, 
+    timedecay_formula=True,
+    normalize=True
+)
+
+
+with Timer() as train_time:
+    model.fit(train)
+
+print("Took {} seconds for training.".format(train_time.interval))
+
+
+print(test)
